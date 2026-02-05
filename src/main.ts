@@ -15,6 +15,9 @@ export default class UpdateTimeOnSavePlugin extends Plugin {
   // @ts-expect-error the settings are hot loaded at init
   settings: UpdateTimeOnEditSettings;
 
+  // Track first touch time per file to debounce initial updates
+  private firstTouchMap: Map<string, number> = new Map();
+
   parseDate(input: number | string): Date | undefined {
     if (typeof input === 'string') {
       try {
@@ -128,6 +131,35 @@ export default class UpdateTimeOnSavePlugin extends Plugin {
     return isAfter(currentMtime, nextUpdate);
   }
 
+  /**
+   * Check if we should wait before processing this file.
+   * Returns true if we should skip this update (still in debounce period).
+   * This ensures we wait minMinutesBetweenSaves BEFORE the first update too.
+   */
+  private shouldWaitForFirstTouch(filePath: string): boolean {
+    const now = Date.now();
+    const firstTouch = this.firstTouchMap.get(filePath);
+
+    if (!firstTouch) {
+      // First time seeing this file modification, record timestamp and wait
+      this.firstTouchMap.set(filePath, now);
+      this.log('First touch recorded, waiting for debounce period:', filePath);
+      return true;
+    }
+
+    const minMs = this.settings.minMinutesBetweenSaves * 60 * 1000;
+    if (now - firstTouch < minMs) {
+      // Not enough time since first touch, keep waiting
+      this.log('Still in debounce period:', filePath);
+      return true;
+    }
+
+    // Enough time has passed, clear the entry and allow processing
+    this.firstTouchMap.delete(filePath);
+    this.log('Debounce period complete, processing:', filePath);
+    return false;
+  }
+
   isExcalidrawFile(file: TFile): boolean {
     const ea: any =
       //@ts-expect-error this is comming from global context, injected by Excalidraw
@@ -169,6 +201,12 @@ export default class UpdateTimeOnSavePlugin extends Plugin {
     }
 
     if (await this.shouldFileBeIgnored(file)) {
+      return { status: 'ignored' };
+    }
+
+    // Wait minMinutesBetweenSaves after first touch before any update
+    // This prevents immediate frontmatter updates on first edit
+    if (triggerSource === 'modify' && this.shouldWaitForFirstTouch(file.path)) {
       return { status: 'ignored' };
     }
 
@@ -244,6 +282,9 @@ ${e.message}`;
 
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
+        // Clean up firstTouchMap for renamed file
+        this.firstTouchMap.delete(oldPath);
+
         const hash = this.settings.fileHashMap[oldPath];
         if (!hash) {
           return;
@@ -256,6 +297,9 @@ ${e.message}`;
 
     this.registerEvent(
       this.app.vault.on('delete', async (file) => {
+        // Clean up firstTouchMap for deleted file
+        this.firstTouchMap.delete(file.path);
+
         const sha = this.settings.fileHashMap[file.path];
         if (!sha) {
           return;
